@@ -1,0 +1,195 @@
+#IMPORTS
+import matplotlib.pyplot as plt
+from scipy.stats import norm, multivariate_normal
+import numpy as np
+import csv
+from sklearn.metrics import confusion_matrix
+from csv import reader
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchsummary import summary # Utility to visualize PyTorch network and shapes
+from sklearn.model_selection import KFold # Important new include
+from scipy.optimize import minimize
+np.set_printoptions(suppress=True)
+import pandas as pd
+from sklearn import tree
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeRegressor
+
+np.set_printoptions(suppress=True)
+np.random.seed(16)
+
+plt.rc('font', size=22)          # controls default text sizes
+plt.rc('axes', titlesize=18)     # fontsize of the axes title
+plt.rc('axes', labelsize=18)     # fontsize of the x and y labels
+plt.rc('xtick', labelsize=14)    # fontsize of the tick labels
+plt.rc('ytick', labelsize=14)    # fontsize of the tick labels
+plt.rc('legend', fontsize=16)    # legend fontsize
+plt.rc('figure', titlesize=22)   # fontsize of the figure title
+
+###################################################################################################
+###################################################################################################
+###################################################################################################
+#FUNCTIONS
+class TwoLayerMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, C):
+        super(TwoLayerMLP, self).__init__()
+        # Fully connected layer WX + b mapping from input_dim (n) -> hidden_layer_dim
+        self.input_fc = nn.Linear(input_dim, hidden_dim)
+        # Output layer again fully connected mapping from hidden_layer_dim -> outputs_dim (C)
+        self.output_fc = nn.Linear(hidden_dim, C)
+        # Log Softmax (faster and better than straight Softmax)
+        # dim=1 refers to the dimension along which the softmax operation is computed
+        # In this case computing probabilities across dim 1, i.e., along classes at output layer
+        self.log_softmax = nn.LogSoftmax(dim=1) 
+        
+    # Don't call this function directly!! 
+    # Simply pass input to model and forward(input) returns output, e.g. model(X)
+    def forward(self, X):
+        # X = [batch_size, input_dim (n)]
+        X = self.input_fc(X)
+        # Non-linear activation function, e.g. ReLU (default good choice)
+        # Could also choose F.softplus(x) for smooth-ReLU, empirically worse than ReLU
+        X = F.relu(X)
+        # X = [batch_size, hidden_dim]
+        # Connect to last layer and output 'logits'
+        X = self.output_fc(X)
+        y = self.log_softmax(X) #Squash logits to probabilities that sum up to 1
+        return y
+    
+###################################################################################################
+def model_train(model, data, labels, criterion, optimizer, num_epochs=25):
+    # Apparently good practice to set this "flag" too before training
+    # Does things like make sure Dropout layers are active, gradients are updated, etc.
+    # Probably not a big deal for our toy network, but still worth developing good practice
+    model.train()
+    # Optimize the neural network
+    for epoch in range(num_epochs):
+        outputs = model(data) #outputs represent the model's predicted probabilities for each class. 
+        loss = criterion(outputs, labels) #Criterion computes the cross entropy loss between input and target
+        optimizer.zero_grad() #Set gradient buffers to zero explicitly before backprop
+        loss.backward() #Backward pass to compute the gradients through the network
+        optimizer.step() # GD step update
+        
+    return model
+
+###################################################################################################
+def model_predict(model, data):
+    # Similar idea to model.train(), set a flag to let network know your in "inference" mode
+    model.eval()
+    # Disabling gradient calculation is useful for inference, only forward pass!!
+    with torch.no_grad():
+        # Evaluate nn on test data and compare to true labels
+        predicted_labels = model(data)
+        predicted_labels = predicted_labels.detach().numpy()
+
+        return np.argmax(predicted_labels, 1)
+    
+###################################################################################################
+def kFoldMLP(percep, X_train, y_train, C):
+    
+    K = 10 #number of folds
+    n_percep = np.max(percep) #Number of perceptrons to evaluate
+    prob_error_train = np.empty((n_percep, K)) #probability error over each
+    mean_prob_err_per_fold = np.empty((n_percep)) #average probability error 
+    # STEP 1: Partition the dataset into K approximately-equal-sized partitions
+    # Shuffles data before doing the division into folds (not necessary, but a good idea)
+     # Number of folds for CV
+    kf = KFold(n_splits=K, shuffle=True) 
+    
+    # STEP 2: Try number of perceptrons between 1-20 for the hidden layer
+    for per in percep:
+        k = 0
+        for train_indices, valid_indices in kf.split(X_train):
+            # Extract the training and validation sets from the K-fold split
+            X_train_k = X_train[train_indices]
+            y_train_k = y_train[train_indices]
+            X_valid_k = X_train[valid_indices]
+            y_valid_k = y_train[valid_indices]
+            
+            # Train model parameters
+            input_dim = X_train_k.shape[1]
+            model = TwoLayerMLP(input_dim, per, C)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+            criterion = nn.CrossEntropyLoss()
+            X_tensor = torch.FloatTensor(X_train_k)
+            y_tensor = torch.LongTensor(y_train_k)
+            X_tensor_valid = torch.FloatTensor(X_valid_k) #what we're testing the model on
+            y_tensor_valid = torch.LongTensor(y_valid_k)
+            model = model_train(model, X_tensor, y_tensor, criterion, optimizer, num_epochs=100) # Trained model 
+            Z = model_predict(model, X_tensor_valid) #predictions resulting from the forward pass through the network
+            
+            #Record Probability Error for Validation Data
+            N = y_tensor_valid.shape
+            conf_mat = confusion_matrix(Z, y_tensor_valid)
+            correct_class_samples = np.sum(np.diag(conf_mat))
+            prob_error_train[per-1, k] = 1 - (correct_class_samples / N)
+            k += 1
+        mean_prob_err_per_fold[per-1] = np.mean(prob_error_train[per-1,:])
+            
+    # STEP 3: Compute the lowest error
+    KF_min_err = np.min(mean_prob_err_per_fold)
+    num_perc = np.argmin(mean_prob_err_per_fold)
+    
+    return KF_min_err, num_perc, mean_prob_err_per_fold
+
+###################################################################################################
+###################################################################################################
+###################################################################################################
+#MAIN
+##Extracting the data from csv file
+with open("neo_v2.csv") as file_name:
+    file_read = csv.reader(file_name)
+    raw_data = list(file_read)
+data = np.array(raw_data)
+
+##Cleaning up the data
+data = np.delete(data, [0,1,6,7], axis=1) #deleting unusued columns - ID, name, orbiting_body, and sentry_object
+Y = np.array(data[1:,5]) #real classification as true/false
+for i in range(len(Y)): #convert classifications to binary integers
+    if Y[i] == "True":
+        Y[i] = 1
+    elif Y[i] == "False":
+        Y[i] = 0
+labels = np.array(data[0,:5]) #labels of each column - est_diam_min, est_diam_max, relative_veloc, miss_dist, abs_mag
+X = np.array(data[1:,:5]) #features
+X = X.astype(float) #convert from string array to float array
+Y = Y.astype(float) #convert from string array to float array
+C = 2 #num of classes - 0/1 binary classification
+
+##Split the data into training and test set (75/25 split)
+x_train, x_test, y_train, y_test = train_test_split(X, Y, random_state=1, train_size = .75) 
+Ntest = len(y_test)
+
+##Find best number of perceptrons to use for our model
+perceptrons = np.arange(1, 20, 1) #testing number of perceptrons between 1-20 in increments of 1
+#kFoldMLP function returns min error, best number of perceptrons, and error over each perceptron for plotting
+MLP_min_err, num_perceptrons, avg_err_percep_arr = kFoldMLP(perceptrons, x_train, y_train, C) 
+fig = plt.figure()
+plt.plot(perceptrons,avg_err_percep_arr, c='k')
+plt.xlabel("Number of Perceptrons")
+plt.ylabel("Average Error over K-Fold CV")
+plt.ylim(.0972, 0.0974)
+plt.show()
+print("The best number of perceptrons is ", num_perceptrons, " which yields an error of ", MLP_min_err)
+num_perceptrons = 11
+
+##Train final MLP classifier using the entire training data set
+input_dim = x_train.shape[1]
+model = TwoLayerMLP(input_dim, num_perceptrons, C)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+criterion = nn.CrossEntropyLoss()
+x_tensor_train = torch.FloatTensor(x_train)
+y_tensor_train = torch.LongTensor(y_train)
+x_tensor_test = torch.FloatTensor(x_test)
+y_tensor_test = torch.LongTensor(y_test)
+
+##Apply trained MLP classifiers to the test data set and estimate the probability of error from this data set
+model = model_train(model, x_tensor_train, y_tensor_train, criterion, optimizer, num_epochs=75) # Trained model 
+Z = model_predict(model, x_tensor_test) #predictions resulting from the forward pass through the network
+conf_mat = confusion_matrix(Z, y_tensor_test)
+correct_class_samples = np.sum(np.diag(conf_mat))
+print(conf_mat)
+prob_err_MLP = 1 - (correct_class_samples / Ntest)
+print("For MLP, the probability of error on the test dataset is ", prob_err_MLP)
